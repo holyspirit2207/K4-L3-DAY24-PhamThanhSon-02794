@@ -1,8 +1,8 @@
 # Verification — điền trước khi nộp
 
-- OS / Python / Gitleaks version:
+- OS / Python / Gitleaks version: Windows 11 (10.0.26300), Python 3.11.9, Gitleaks 8.30.1, pre-commit 4.6.2
 - `python -m pytest tests/ -q`:
-- `pre-commit run --all-files`:
+- `pre-commit run --all-files`: Passed
 - Ledger verify:
 - Các lỗi còn lại:
 
