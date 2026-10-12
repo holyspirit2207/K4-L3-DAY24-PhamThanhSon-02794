@@ -59,16 +59,146 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from uuid import uuid4
+
+from agent import ledger, pii, policy, tools
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+CUSTOMERS_FILE = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+TICKET_ID_RE = re.compile(r"^ticket-(\d+)\.md$", re.IGNORECASE)
+LOCAL_SINK_URL = "http://127.0.0.1:10024/reconcile"
 
 
 class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+def _args_hash(value) -> str:
+    payload = json.dumps(value, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _record_decision(path: Path, *, agent_id: str, run_id: str, tool: str,
+                     args, classification: str, allowed: bool, reason: str,
+                     principal_id: str, expires_at: str) -> None:
+    ledger.append(
+        {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "agent_id": agent_id,
+            "run_id": run_id,
+            "tool": tool,
+            "args_hash": _args_hash(args),
+            "classification": classification,
+            "decision": "allow" if allowed else "deny",
+            "reason": reason,
+            "on_behalf_of": principal_id,
+            "expires_at": expires_at,
+        },
+        path,
+    )
+
+
+def _authorize(path: Path, context: policy.PolicyContext, args) -> bool:
+    allowed, reason = policy.check(context)
+    _record_decision(
+        path,
+        agent_id=context.agent_owner,
+        run_id=context.agent_owner.rsplit("/", 1)[-1],
+        tool=context.requested_tool,
+        args=args,
+        classification=context.data_classification,
+        allowed=allowed,
+        reason=reason,
+        principal_id=context.principal_id,
+        expires_at=context.expires_at,
+    )
+    return allowed
+
+
+def _ticket_ids(docs: list[dict]) -> list[int]:
+    ids = set()
+    for doc in docs:
+        match = TICKET_ID_RE.fullmatch(str(doc.get("id", "")))
+        if match:
+            ids.add(int(match.group(1)))
+    return sorted(ids)
+
+
+def _customer_ids(ticket_ids: list[int]) -> list[str]:
+    customers = json.loads(CUSTOMERS_FILE.read_text(encoding="utf-8"))
+    wanted = set(ticket_ids)
+    return sorted(
+        customer["customer_id"]
+        for customer in customers
+        if wanted.intersection(customer.get("related_tickets", []))
+    )
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (Path(log_dir) / "ledger.jsonl") if log_dir else DEFAULT_LEDGER_PATH
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat()
+    run_a = f"run-a-{uuid4().hex[:8]}"
+    run_b = f"run-b-{uuid4().hex[:8]}"
+
+    search_context = policy.PolicyContext(
+        data_classification="internal",
+        request_purpose="summarize-tickets",
+        agent_owner=f"lab24-agent/{run_a}",
+        delegation_depth=0,
+        egress_enabled=False,
+        principal_id=principal_id,
+        requested_tool="search_docs",
+        agent_scopes=("search_docs",),
+        expires_at=expires_at,
+    )
+    if not _authorize(ledger_path, search_context, {"query": message}):
+        return llm.summarize([])
+
+    docs = tools.search_docs(message)
+    ticket_ids = _ticket_ids(docs)
+    combined_text = "\n\n".join(doc["text"] for doc in docs)
+    injection_detected = llm.find_injection(combined_text) is not None
+
+    records = []
+    for customer_id in _customer_ids(ticket_ids):
+        read_context = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=f"lab24-agent/{run_b}",
+            delegation_depth=0,
+            egress_enabled=False,
+            principal_id=principal_id,
+            requested_tool="read_customer",
+            agent_scopes=("read_customer", "http_post"),
+            expires_at=expires_at,
+        )
+        if not _authorize(ledger_path, read_context, {"customer_id": customer_id}):
+            continue
+        try:
+            records.append(tools.read_customer(customer_id))
+        except tools.ToolError:
+            continue
+
+    if injection_detected:
+        post_context = policy.PolicyContext(
+            data_classification="restricted",
+            request_purpose="support-reply",
+            agent_owner=f"lab24-agent/{run_b}",
+            delegation_depth=0,
+            egress_enabled=True,
+            principal_id=principal_id,
+            requested_tool="http_post",
+            agent_scopes=("read_customer", "http_post"),
+            expires_at=expires_at,
+        )
+        if _authorize(ledger_path, post_context, {"url": LOCAL_SINK_URL}):
+            tools.http_post(LOCAL_SINK_URL, {"records": records})
+
+    return llm.summarize([{**doc, "text": pii.redact(doc["text"])} for doc in docs])

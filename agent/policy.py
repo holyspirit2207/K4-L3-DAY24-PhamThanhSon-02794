@@ -34,7 +34,14 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+PRINCIPALS_FILE = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+CLASSIFICATIONS = {"public", "internal", "restricted"}
 
 
 @dataclass(frozen=True)
@@ -52,4 +59,42 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    if context.data_classification not in CLASSIFICATIONS:
+        return False, "unknown data classification"
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot cross an egress-enabled boundary"
+
+    try:
+        principals = json.loads(PRINCIPALS_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False, "principal registry is unavailable"
+
+    principal = principals.get(context.principal_id)
+    if principal is None:
+        return False, "unknown principal"
+
+    if not context.expires_at:
+        return False, "authorization has no expiry"
+    try:
+        expires_at = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+        if expires_at.tzinfo is None:
+            return False, "authorization expiry must include a timezone"
+        if expires_at <= datetime.now(timezone.utc):
+            return False, "authorization has expired"
+    except ValueError:
+        return False, "authorization expiry is invalid"
+
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, "principal is not allowed to use this purpose"
+
+    tool = context.requested_tool
+    if not tool:
+        return False, "requested tool is missing"
+    if tool not in principal.get("allowed_tools", []):
+        return False, "principal is not allowed to use this tool"
+    if tool not in context.agent_scopes:
+        return False, "tool is outside the agent scope"
+    if context.delegation_depth > 0 and tool not in context.parent_scopes:
+        return False, "delegation cannot expand the parent scope"
+
+    return True, "principal, purpose, scope and expiry checks passed"

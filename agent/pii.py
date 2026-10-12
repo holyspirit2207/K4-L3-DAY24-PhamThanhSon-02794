@@ -30,10 +30,51 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+
+_PATTERNS = (
+    (
+        "EMAIL",
+        re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE),
+        0,
+    ),
+    (
+        "VN_CCCD",
+        re.compile(r"\b(?:CCCD|căn\s*cước(?:\s*công\s*dân)?)\s*(?:của\s+[^:,.]{1,40}\s*)?(?::|là)?\s*(\d{12})\b", re.IGNORECASE),
+        1,
+    ),
+    (
+        "VN_PHONE",
+        re.compile(r"\b(?:SĐT|số\s*điện\s*thoại|điện\s*thoại)\b[^\d]{0,50}(0(?:[ .-]?\d){9,10})\b", re.IGNORECASE),
+        1,
+    ),
+    (
+        "VN_BANK_ACCOUNT",
+        re.compile(r"\b(?:STK|số\s*tài\s*khoản|tài\s*khoản)\b[^\d]{0,30}(\d{8,16})\b", re.IGNORECASE),
+        1,
+    ),
+)
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    entities = []
+    occupied: list[tuple[int, int]] = []
+
+    for entity_type, pattern, group in _PATTERNS:
+        for match in pattern.finditer(text):
+            start, end = match.span(group)
+            if any(start < used_end and used_start < end for used_start, used_end in occupied):
+                continue
+            entities.append({"type": entity_type, "start": start, "end": end})
+            occupied.append((start, end))
+
+    return sorted(entities, key=lambda entity: (entity["start"], entity["end"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    redacted = text
+    for entity in reversed(detect(text)):
+        marker = f"[REDACTED_{entity['type']}]"
+        redacted = redacted[:entity["start"]] + marker + redacted[entity["end"]:]
+    return redacted
